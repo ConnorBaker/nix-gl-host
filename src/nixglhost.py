@@ -16,7 +16,7 @@ from glob import glob
 from typing import List, Literal, Dict, Tuple, TypedDict, TextIO, Optional
 
 IN_NIX_STORE = False
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 if IN_NIX_STORE:
@@ -152,7 +152,7 @@ class CacheDirContent:
 
     def __init__(self, paths: List[LibraryPath], version: int = CACHE_VERSION):
         self.paths: List[LibraryPath] = paths
-        self.version: int = CACHE_VERSION
+        self.version: int = version
 
     def to_json(self):
         d = {"paths": [p.to_dict() for p in self.paths], "version": self.version}
@@ -180,6 +180,9 @@ NVIDIA_DSO_PATTERNS = [
     "libGLESv1_CM_nvidia\\.so.*$",
     "libGLESv2_nvidia\\.so.*$",
     "libglxserver_nvidia\\.so.*$",
+    # libnvcucompat and libnvcuextend are dlopened by libcuda.
+    "libnvcucompat\\.so.*$",
+    "libnvcuextend\\.so.*$",
     "libnvcuvid\\.so.*$",
     "libnvidia-allocator\\.so.*$",
     "libnvidia-cfg\\.so.*$",
@@ -192,11 +195,16 @@ NVIDIA_DSO_PATTERNS = [
     "libnvidia-glvkspirv\\.so.*$",
     "libnvidia-gpucomp\\.so.*$",
     "libnvidia-ngx\\.so.*$",
-    "libnvidia-nvvm\\.so.*$",
+    # Matches both libnvidia-nvvm.so and libnvidia-nvvm70.so (the
+    # latter is dlopened by libcuda).
+    "libnvidia-nvvm[0-9]*\\.so.*$",
     "libnvidia-opencl\\.so.*$",
     "libnvidia-opticalflow\\.so.*$",
+    "libnvidia-pkcs11\\.so.*$",
+    "libnvidia-pkcs11-openssl3\\.so.*$",
     "libnvidia-ptxjitcompiler\\.so.*$",
     "libnvidia-rtcore\\.so.*$",
+    "libnvidia-tileiras\\.so.*$",
     "libnvidia-tls\\.so.*$",
     "libnvidia-vulkan-producer\\.so.*$",
     "libnvidia-wayland-client\\.so.*$",
@@ -355,6 +363,53 @@ def copy_and_patch_libs(
         os.chmod(newpath, os.stat(dso.fullpath).st_mode | stat.S_IWUSR)
         new_paths.append(newpath)
     patch_dsos(new_paths, rpath)
+    create_dso_symlinks(new_paths)
+
+
+def get_dso_soname(dso_path: str) -> Optional[str]:
+    """Returns the DT_SONAME of the DSO_PATH ELF file, None if it
+    doesn't have one or if we can't read it."""
+    try:
+        res = subprocess.run(
+            [PATCHELF_PATH, "--print-soname", dso_path],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    soname = res.stdout.strip()
+    if res.returncode != 0 or not soname or "/" in soname:
+        return None
+    return soname
+
+
+def unversioned_dso_name(name: str) -> Optional[str]:
+    """Returns the unversioned name of a versioned DSO NAME
+    (libfoo.so.1.2 -> libfoo.so), None if NAME isn't versioned."""
+    m = re.match(r"^(.+\.so)\.[^/]+$", name)
+    return m.group(1) if m else None
+
+
+def create_dso_symlinks(dso_paths: List[str]) -> None:
+    """Mirrors what the NixOS nvidia driver package does: for each
+    DSO, make sure both its soname and its unversioned name
+    (libfoo.so) exist next to it.
+
+    The host package manager does not always ship these names (eg. the
+    host only ships libnvcuextend.so.1 while libcuda dlopens
+    libnvcuextend.so). We never override a file already living in the
+    directory."""
+    for dso_path in dso_paths:
+        dirpath, name = os.path.split(dso_path)
+        link_names = [get_dso_soname(dso_path), unversioned_dso_name(name)]
+        for link_name in link_names:
+            if link_name is None or link_name == name:
+                continue
+            link_path = os.path.join(dirpath, link_name)
+            if os.path.lexists(link_path):
+                continue
+            log_info(f"Symlinking {link_path} to {name}")
+            os.symlink(name, link_path)
 
 
 def log_info(string: str) -> None:
