@@ -1115,6 +1115,24 @@ mod tests {
     }
 
     #[test]
+    fn test_mtime_json_roundtrip() {
+        // Sub-second mtimes must survive a JSON round trip, otherwise the
+        // cache never looks up to date.
+        let lib = ResolvedLib {
+            name: "libnvcuextend.so.1".to_string(),
+            dirpath: "/lib".to_string(),
+            fullpath: "/lib/libnvcuextend.so.1".to_string(),
+            last_modification: 1791755338.4750113,
+            size: 26,
+            is_symlink: true,
+            symlink_target: Some("libnvcuextend.so.615.71.09".to_string()),
+        };
+        let json = serde_json::to_string(&lib).unwrap();
+        let parsed: ResolvedLib = serde_json::from_str(&json).unwrap();
+        assert_eq!(lib, parsed);
+    }
+
+    #[test]
     fn test_cache_version_mismatch_is_stale() {
         let current = CacheDirContent::new(Vec::new());
         let old = CacheDirContent {
