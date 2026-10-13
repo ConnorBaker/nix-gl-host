@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const IN_NIX_STORE: bool = false;
-const CACHE_VERSION: i32 = 4;
+const CACHE_VERSION: i32 = 5;
 const PATCHELF_PATH: &str = if IN_NIX_STORE {
     "@patchelf-bin@"
 } else {
@@ -181,6 +181,8 @@ lazy_static::lazy_static! {
         Regex::new(r"libGLESv1_CM_nvidia\.so.*$").unwrap(),
         Regex::new(r"libGLESv2_nvidia\.so.*$").unwrap(),
         Regex::new(r"libglxserver_nvidia\.so.*$").unwrap(),
+        // libnvcucompat is dlopened by libcuda and may not carry the driver version.
+        Regex::new(r"libnvcucompat\.so.*$").unwrap(),
         Regex::new(r"libnvcuvid\.so.*$").unwrap(),
         Regex::new(r"libnvidia-allocator\.so.*$").unwrap(),
         Regex::new(r"libnvidia-cfg\.so.*$").unwrap(),
@@ -193,7 +195,9 @@ lazy_static::lazy_static! {
         Regex::new(r"libnvidia-glvkspirv\.so.*$").unwrap(),
         Regex::new(r"libnvidia-gpucomp\.so.*$").unwrap(),
         Regex::new(r"libnvidia-ngx\.so.*$").unwrap(),
-        Regex::new(r"libnvidia-nvvm\.so.*$").unwrap(),
+        // Matches both libnvidia-nvvm.so and libnvidia-nvvm70.so (the latter is
+        // dlopened by libcuda and isn't suffixed with the driver version).
+        Regex::new(r"libnvidia-nvvm[0-9]*\.so.*$").unwrap(),
         Regex::new(r"libnvidia-opencl\.so.*$").unwrap(),
         Regex::new(r"libnvidia-opticalflow\.so.*$").unwrap(),
         Regex::new(r"libnvidia-ptxjitcompiler\.so.*$").unwrap(),
@@ -574,6 +578,50 @@ fn copy_and_patch_libs(
 
     if !new_paths.is_empty() {
         patch_dsos(&new_paths, rpath)?;
+    }
+
+    create_dso_symlinks(&new_paths)?;
+    Ok(())
+}
+
+/// Names a DSO named `name` with DT_SONAME `soname` should also be reachable
+/// under: its soname and its unversioned name (libfoo.so.1.2 -> libfoo.so).
+fn dso_link_names(name: &str, soname: Option<&str>) -> Vec<String> {
+    let mut links = Vec::new();
+    for link in [soname.map(str::to_string), get_so_link(name)]
+        .into_iter()
+        .flatten()
+    {
+        if link != name && !link.contains('/') && !links.contains(&link) {
+            links.push(link);
+        }
+    }
+    links
+}
+
+/// Mirrors what the NixOS nvidia driver package does: make sure every DSO is
+/// reachable through both its soname and its unversioned name.
+///
+/// The host does not always ship these names (eg. it only ships
+/// libnvcuextend.so.1 while libcuda dlopens libnvcuextend.so). Files already
+/// living in the directory are never overwritten.
+fn create_dso_symlinks(dso_paths: &[PathBuf]) -> std::io::Result<()> {
+    for dso_path in dso_paths {
+        let (Some(dir), Some(name)) = (
+            dso_path.parent(),
+            dso_path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            continue;
+        };
+        let soname = get_soname(dso_path);
+        for link_name in dso_link_names(name, soname.as_deref()) {
+            let link_path = dir.join(&link_name);
+            if link_path.symlink_metadata().is_ok() {
+                continue;
+            }
+            log_info(&format!("Symlinking {:?} to {}", link_path, name));
+            std::os::unix::fs::symlink(name, &link_path)?;
+        }
     }
     Ok(())
 }
@@ -1064,6 +1112,81 @@ mod tests {
         let golden_cdc = CacheDirContent::from_json(&json).unwrap();
         assert_eq!(cdc, golden_cdc);
         assert_eq!(cdc.to_json(), golden_cdc.to_json());
+    }
+
+    #[test]
+    fn test_cache_version_mismatch_is_stale() {
+        let current = CacheDirContent::new(Vec::new());
+        let old = CacheDirContent {
+            paths: Vec::new(),
+            version: CACHE_VERSION - 1,
+        };
+        assert_ne!(current, old);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("cache.json");
+        fs::write(&cache_file, old.to_json()).unwrap();
+        assert!(!is_dso_cache_up_to_date(&current, &cache_file));
+        fs::write(&cache_file, current.to_json()).unwrap();
+        assert!(is_dso_cache_up_to_date(&current, &cache_file));
+    }
+
+    #[test]
+    fn test_cuda_driver_dlopened_dsos_match() {
+        let matches = |name: &str| NVIDIA_DSO_PATTERNS.iter().any(|p| p.is_match(name));
+        for name in [
+            "libnvidia-nvvm.so.4",
+            "libnvidia-nvvm70.so.4",
+            "libnvidia-nvvm70.so",
+            "libnvcucompat.so",
+            "libnvidia-ptxjitcompiler.so.1",
+        ] {
+            assert!(matches(name), "{name} should match");
+        }
+    }
+
+    #[test]
+    fn test_dso_link_names() {
+        assert_eq!(
+            dso_link_names("libnvcuextend.so.615.71.09", Some("libnvcuextend.so.1")),
+            vec!["libnvcuextend.so.1", "libnvcuextend.so"]
+        );
+        assert_eq!(
+            dso_link_names("libnvidia-nvvm70.so.4", Some("libnvidia-nvvm70.so.4")),
+            vec!["libnvidia-nvvm70.so"]
+        );
+        assert_eq!(
+            dso_link_names("libnvidia-tileiras.so.615.71.09", None),
+            vec!["libnvidia-tileiras.so"]
+        );
+        assert!(dso_link_names("libfoo.so", Some("libfoo.so")).is_empty());
+        assert_eq!(
+            dso_link_names("libfoo.so.1", Some("../evil.so")),
+            vec!["libfoo.so"]
+        );
+    }
+
+    #[test]
+    fn test_create_dso_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let versioned = dir.path().join("libnvcuextend.so.615.71.09");
+        fs::write(&versioned, b"not an ELF file").unwrap();
+        let existing = dir.path().join("libother.so.2");
+        fs::write(&existing, b"not an ELF file").unwrap();
+        let existing_link = dir.path().join("libother.so");
+        fs::write(&existing_link, b"already here").unwrap();
+
+        create_dso_symlinks(&[versioned.clone(), existing.clone()]).unwrap();
+
+        assert_eq!(
+            fs::read_link(dir.path().join("libnvcuextend.so")).unwrap(),
+            PathBuf::from("libnvcuextend.so.615.71.09")
+        );
+        // Existing files are never overwritten.
+        assert_eq!(fs::read(&existing_link).unwrap(), b"already here");
+
+        // Running it twice is a no-op.
+        create_dso_symlinks(&[versioned]).unwrap();
     }
 
     #[test]
